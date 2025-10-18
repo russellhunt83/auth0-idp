@@ -1,0 +1,6 @@
+[default]
+tenant_domain = yourdomain.auth0.com
+auth0_client_id = {YOUR_CLIENT_ID}
+aws_role_arn = arn:aws:iam::{AWS_ACCOUNT_ID}:role/{ROLE}
+aws_profile = default
+aws_region = {aws_region}

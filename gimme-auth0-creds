@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import time
+
+import threading
+import socket
+
+import argparse
+import pathlib
+import configparser
+
+import base64
+import hashlib
+import secrets
+
+import webbrowser
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+import re
+import urllib.parse as urlparse
+import requests
+
+
+
+def load_config():
+    # ── Config loader
+    parser = argparse.ArgumentParser(description="Auth0 → AWS OIDC login (PKCE loopback)")
+    parser.add_argument("--conf", help="Path to config file (default: env var AUTH0_AWS_CONF or ~/.auth0_aws_login_conf)")
+    parser.add_argument("--port", "-p", type=int, default=53682, help="Local loopback port to listen on (default: 53682)")
+    args = parser.parse_args()
+
+    conf_path = (
+        pathlib.Path(args.conf).expanduser() if args.conf else
+        pathlib.Path(os.getenv("AUTH0_AWS_CONF", "~/.auth0_aws_login_conf")).expanduser()
+    )
+
+    if not conf_path.exists():
+        print(f"Config file not found: {conf_path}", file=sys.stderr)
+        sys.exit(1)
+
+    cfg = configparser.ConfigParser()
+    cfg.read(conf_path)
+    section = "default"
+
+    return {
+        "TENANT_DOMAIN": cfg.get(section, "tenant_domain"),
+        "AUTH0_CLIENT_ID": cfg.get(section, "auth0_client_id"),
+        "AWS_ROLE_ARN": cfg.get(section, "aws_role_arn"),
+        "AWS_PROFILE": cfg.get(section, "aws_profile", fallback="auth0"),
+        "AWS_REGION": cfg.get(section, "aws_region", fallback="us-east-1"),
+        "SCOPE": cfg.get(section, "scope", fallback="openid profile email"),
+        "PORT": args.port
+    }
+
+# PKCE helpers
+def b64url(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+def mk_pkce():
+    verifier = b64url(secrets.token_bytes(32))
+    challenge = b64url(hashlib.sha256(verifier.encode()).digest())
+    return verifier, challenge
+
+# Ensure port 53682 is free 
+def ensure_port_free(port=53682):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            print(f"ERROR: Port {port} is already in use. Please stop existing process already using this port.", file=sys.stderr)
+            sys.exit(1)
+
+#  Minimal HTTP handler to capture the redirect
+class CaptureHandler(BaseHTTPRequestHandler):
+    server_version = "Auth0PKCEServer/1.0"
+    code = None
+    state_expected = None
+    error = None
+
+    def do_GET(self):
+        parsed = urlparse.urlparse(self.path)
+        if parsed.path != "/callback":
+            self.send_response(404); self.end_headers(); return
+        qs = dict(urlparse.parse_qsl(parsed.query))
+        if "error" in qs:
+            type(self).error = qs.get("error_description", qs["error"])
+        elif qs.get("state") != self.state_expected:
+            self.error = "state_mismatch"
+        else:
+            type(self).code = qs.get("code")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        msg = "You can close this tab and return to the terminal."
+        title = "Login Successful"
+        color = "#2ecc71"  # green
+
+        if self.error:
+            title = "Login Failed"
+            color = "#e74c3c"  # red
+            msg = f"{self.error}<br>{msg}"
+
+        html = open("./index.html", "r",encoding="utf-8").read() if os.path.exists("./index.html") else "ERROR"
+        html = (
+        html
+            .replace("{{title}}", title)
+            .replace("{{color}}", color)
+            .replace("{{msg}}", msg)
+        )
+        self.wfile.write(html.encode("utf-8"))
+        # if self.error: msg = f"Login failed: {self.error}. {msg}"
+        # self.wfile.write(f"<pre>{msg}</pre>".encode())
+
+def get_code_via_loopback(auth_url, state, port):
+    CaptureHandler.state_expected = state
+    httpd = HTTPServer(("127.0.0.1", port), CaptureHandler)
+    t = threading.Thread(target=httpd.handle_request)  # serve one request
+    t.start()
+    print("\nOpen this URL in your browser and log in:\n")
+    print(auth_url, "\n")
+    try: webbrowser.open(auth_url)
+    except Exception: pass
+    timeout = time.time() + 300
+    while t.is_alive() and time.time() < timeout:
+        time.sleep(0.2)
+    httpd.server_close()
+    if CaptureHandler.error:
+        raise SystemExit(f"Auth error: {CaptureHandler.error}")
+    if not CaptureHandler.code:
+        raise SystemExit("No authorization code received (timeout?).")
+    return CaptureHandler.code
+
+# Token exchange 
+def exchange_code_for_tokens(code, verifier, tenant, client_id, redirect_uri):
+    token_url = f"https://{tenant}/oauth/token"
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "code_verifier": verifier,
+        "code": code,
+        "redirect_uri": redirect_uri,
+    }
+    r = requests.post(token_url, data=data, headers={"Content-Type":"application/x-www-form-urlencoded"})
+    if r.status_code != 200:
+        raise SystemExit(f"Token exchange failed: {r.status_code} {r.text}")
+    j = r.json()
+    if "id_token" not in j:
+        raise SystemExit(f"No id_token in response: {j}")
+    return j["id_token"]
+
+# AWS STS assume-role-with-web-identity 
+def assume_role_with_web_identity(id_token, role_arn):
+    params = {
+        "Action": "AssumeRoleWithWebIdentity",
+        "Version": "2011-06-15",
+        "RoleArn": role_arn,
+        "RoleSessionName": "Auth0-cli",
+        "WebIdentityToken": id_token,
+    }
+    r = requests.post("https://sts.amazonaws.com/", data=params)
+    if r.status_code != 200:
+        raise SystemExit(f"STS failed: {r.status_code} {r.text}")
+    
+    def get(tag):
+        m = re.search(fr"<{tag}>([^<]+)</{tag}>", r.text)
+        return m.group(1) if m else None
+    creds = {
+        "AccessKeyId": get("AccessKeyId"),
+        "SecretAccessKey": get("SecretAccessKey"),
+        "SessionToken": get("SessionToken"),
+        "Expiration": get("Expiration")
+    }
+    if not all(creds.values()):
+        raise SystemExit(f"Could not parse STS credentials.\n{r.text}")
+    return creds
+
+# Write AWS creds file 
+def write_aws_creds(profile, creds, region):
+    cred_path = pathlib.Path("~/.aws/credentials").expanduser()
+    cred_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg = configparser.RawConfigParser()
+    if cred_path.exists(): cfg.read(cred_path)
+    if not cfg.has_section(profile): cfg.add_section(profile)
+    cfg.set(profile, "aws_access_key_id", creds["AccessKeyId"])
+    cfg.set(profile, "aws_secret_access_key", creds["SecretAccessKey"])
+    cfg.set(profile, "aws_session_token", creds["SessionToken"])
+    cfg.set(profile, "region", region)
+    with cred_path.open("w") as f: cfg.write(f)
+    return cred_path
+
+def main():
+    '''
+    Generate AWS creds via Auth0 OIDC login
+    '''
+    conf = load_config()
+    TENANT_DOMAIN = conf["TENANT_DOMAIN"]
+    AUTH0_CLIENT_ID = conf["AUTH0_CLIENT_ID"]
+    AWS_ROLE_ARN = conf["AWS_ROLE_ARN"]
+    AWS_PROFILE = conf["AWS_PROFILE"]
+    AWS_REGION = conf["AWS_REGION"]
+    SCOPE = conf["SCOPE"]
+
+    port = conf["PORT"]
+    ensure_port_free(port)
+    REDIRECT_URI = f"http://127.0.0.1:{port}/callback"
+
+    verifier, challenge = mk_pkce()
+    state = b64url(secrets.token_bytes(16))
+    q = {
+        "response_type": "code",
+        "client_id": AUTH0_CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "scope": SCOPE,
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    auth_url = f"https://{TENANT_DOMAIN}/authorize?" + urlparse.urlencode(q)
+
+    code = get_code_via_loopback(auth_url, state, port)
+    id_token = exchange_code_for_tokens(code, verifier, TENANT_DOMAIN, AUTH0_CLIENT_ID, REDIRECT_URI)
+    creds = assume_role_with_web_identity(id_token, AWS_ROLE_ARN)
+    path = write_aws_creds(AWS_PROFILE, creds, AWS_REGION)
+
+    print(f"\nWrote AWS creds to {path} under profile [{AWS_PROFILE}].")
+    print(f"Expires: {creds['Expiration']}")
+    print(f"Try: AWS_PROFILE={AWS_PROFILE} aws sts get-caller-identity")
+
+if __name__ == "__main__":
+    main()
