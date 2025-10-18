@@ -66,7 +66,7 @@ It covers creating an Auth0 SSO using a (Free) application.
     ```
     python3 -m venv .venv \
     source ./venv/bin/activate \
-    pip install -r requirements.txt
+    pip install -r requirements.txt \
     ./gimme-auth0-creds
     ```
 
