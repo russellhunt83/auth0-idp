@@ -65,7 +65,7 @@ It covers creating an Auth0 SSO using a (Free) application.
     Finally, from the directory that has the gimme-auth0-creds file :
     ```
     python3 -m venv .venv \
-    source ./venv/bin/activate \
+    source ./.venv/bin/activate \
     pip install -r requirements.txt \
     ./gimme-auth0-creds
     ```
