@@ -63,13 +63,13 @@ Short guide to configure Auth0 as an identity provider (IdP). This script allows
     ```
     chmod +x ./gimme-auth0-creds
     ```
-
-    Finally, from the directory that has the gimme-auth0-creds file :
+5. Run the app
+    From the directory that has the gimme-auth0-creds file :
     ```
     python3 -m venv .venv \
-    source ./.venv/bin/activate \
-    pip install -r requirements.txt \
-    ./gimme-auth0-creds
+    && source ./.venv/bin/activate \
+    && pip install -r requirements.txt \
+    && ./gimme-auth0-creds
     ```
 
     Follow the browser prompts.
